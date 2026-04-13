@@ -8,9 +8,11 @@ import websockets
 import json
 import logging
 from datetime import datetime
-from typing import Dict, Set
+from typing import Dict, Set, Optional
 import sqlite3
 import os
+import hashlib
+import aiosqlite
 
 # Настройка логирования
 logging.basicConfig(
@@ -29,9 +31,13 @@ class ShiftServer:
     """Класс сервера мессенджера SHIFT"""
     
     def __init__(self):
-        self.connected_clients: Dict[str, websockets.WebSocketServerProtocol] = {}
+        self.connected_clients: Dict[str, websockets.ServerConnection] = {}
         self.user_rooms: Dict[str, Set[str]] = {}  # username -> set of room_ids
         self.init_database()
+    
+    def _hash_password(self, password: str) -> str:
+        """Хеширование пароля с использованием SHA-256"""
+        return hashlib.sha256(password.encode()).hexdigest()
     
     def init_database(self):
         """Инициализация базы данных"""
@@ -45,7 +51,7 @@ class ShiftServer:
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
-                password TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -90,34 +96,42 @@ class ShiftServer:
     
     async def register_user(self, username: str, password: str) -> dict:
         """Регистрация нового пользователя"""
+        if not isinstance(username, str) or not isinstance(password, str):
+            return {"type": "register", "success": False, "message": "Некорректные данные"}
+        username = username.strip()
+        if not username or not password.strip():
+            return {"type": "register", "success": False, "message": "Логин и пароль не могут быть пустыми"}
         try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                'INSERT INTO users (username, password) VALUES (?, ?)',
-                (username, password)
-            )
-            conn.commit()
-            conn.close()
+            password_hash = self._hash_password(password)
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute(
+                    'INSERT INTO users (username, password_hash) VALUES (?, ?)',
+                    (username, password_hash)
+                )
+                await conn.commit()
             logger.info(f"Пользователь {username} зарегистрирован")
-            return {"success": True, "message": "Пользователь успешно зарегистрирован"}
+            return {"type": "register", "success": True, "message": "Пользователь успешно зарегистрирован"}
         except sqlite3.IntegrityError:
-            return {"success": False, "message": "Пользователь уже существует"}
+            return {"type": "register", "success": False, "message": "Пользователь уже существует"}
         except Exception as e:
             logger.error(f"Ошибка регистрации: {e}")
-            return {"success": False, "message": str(e)}
+            return {"type": "register", "success": False, "message": str(e)}
     
     async def authenticate_user(self, username: str, password: str) -> dict:
         """Аутентификация пользователя"""
+        if not isinstance(username, str) or not isinstance(password, str):
+            return {"success": False, "message": "Некорректные данные"}
+        username = username.strip()
+        if not username or not password.strip():
+            return {"success": False, "message": "Не указаны логин или пароль"}
         try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                'SELECT id FROM users WHERE username = ? AND password = ?',
-                (username, password)
-            )
-            result = cursor.fetchone()
-            conn.close()
+            password_hash = self._hash_password(password)
+            async with aiosqlite.connect(DB_PATH) as conn:
+                cursor = await conn.execute(
+                    'SELECT id FROM users WHERE username = ? AND password_hash = ?',
+                    (username, password_hash)
+                )
+                result = await cursor.fetchone()
             
             if result:
                 return {"success": True, "message": "Аутентификация успешна"}
@@ -130,16 +144,13 @@ class ShiftServer:
     async def save_message(self, sender: str, receiver: str, content: str) -> int:
         """Сохранение сообщения в базу данных"""
         try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                'INSERT INTO messages (sender, receiver, content) VALUES (?, ?, ?)',
-                (sender, receiver, content)
-            )
-            message_id = cursor.lastrowid
-            conn.commit()
-            conn.close()
-            return message_id
+            async with aiosqlite.connect(DB_PATH) as conn:
+                cursor = await conn.execute(
+                    'INSERT INTO messages (sender, receiver, content) VALUES (?, ?, ?)',
+                    (sender, receiver, content)
+                )
+                await conn.commit()
+                return cursor.lastrowid
         except Exception as e:
             logger.error(f"Ошибка сохранения сообщения: {e}")
             return -1
@@ -147,17 +158,16 @@ class ShiftServer:
     async def get_message_history(self, user1: str, user2: str, limit: int = 50) -> list:
         """Получение истории сообщений между двумя пользователями"""
         try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT sender, receiver, content, timestamp, is_read
-                FROM messages
-                WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
-                ORDER BY timestamp DESC
-                LIMIT ?
-            ''', (user1, user2, user2, user1, limit))
-            messages = cursor.fetchall()
-            conn.close()
+            async with aiosqlite.connect(DB_PATH) as conn:
+                cursor = await conn.execute('''
+                    SELECT sender, receiver, content, timestamp, is_read
+                    FROM messages
+                    WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                ''', (user1, user2, user2, user1, limit))
+                messages = await cursor.fetchall()
+            
             return [
                 {
                     "sender": msg[0],
@@ -172,6 +182,17 @@ class ShiftServer:
             logger.error(f"Ошибка получения истории: {e}")
             return []
     
+    async def get_all_users(self) -> list:
+        """Получение списка всех зарегистрированных пользователей"""
+        try:
+            async with aiosqlite.connect(DB_PATH) as conn:
+                cursor = await conn.execute('SELECT username FROM users')
+                users = await cursor.fetchall()
+            return [user[0] for user in users]
+        except Exception as e:
+            logger.error(f"Ошибка получения списка пользователей: {e}")
+            return []
+    
     async def broadcast_to_user(self, username: str, message: dict):
         """Отправка сообщения конкретному пользователю"""
         if username in self.connected_clients:
@@ -180,73 +201,90 @@ class ShiftServer:
             except Exception as e:
                 logger.error(f"Ошибка отправки сообщения {username}: {e}")
     
-    async def handle_client(self, websocket: websockets.WebSocketServerProtocol):
+    async def handle_client(self, websocket: websockets.ServerConnection):
         """Обработка подключения клиента"""
         username = None
         
         try:
-            # Ожидание аутентификации
-            auth_message = await websocket.recv()
-            auth_data = json.loads(auth_message)
-            
-            if auth_data.get('type') == 'auth':
-                username = auth_data.get('username')
-                password = auth_data.get('password')
-                
-                if not username or not password:
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                except json.JSONDecodeError:
                     await websocket.send(json.dumps({
                         "type": "error",
-                        "message": "Не указаны логин или пароль"
+                        "message": "Неверный формат JSON"
                     }))
-                    return
-                
-                # Проверка аутентификации
-                auth_result = await self.authenticate_user(username, password)
-                if not auth_result['success']:
-                    await websocket.send(json.dumps({
-                        "type": "error",
-                        "message": auth_result['message']
-                    }))
-                    return
-                
-                # Регистрация подключения
-                self.connected_clients[username] = websocket
-                logger.info(f"Пользователь {username} подключился")
-                
-                await websocket.send(json.dumps({
-                    "type": "connected",
-                    "message": "Подключение к серверу SHIFT установлено",
-                    "username": username
-                }))
-                
-                # Обработка сообщений
-                async for message in websocket:
-                    try:
-                        data = json.loads(message)
-                        await process_message(self, username, data)
-                    except json.JSONDecodeError:
+                    continue
+
+                if username is None:
+                    msg_type = data.get('type')
+                    if msg_type == 'register':
+                        reg_user = data.get('username')
+                        reg_pass = data.get('password')
+                        if not reg_user or not reg_pass:
+                            await websocket.send(json.dumps({
+                                "type": "register",
+                                "success": False,
+                                "message": "Не указаны логин или пароль"
+                            }))
+                            continue
+                        register_result = await self.register_user(reg_user, reg_pass)
+                        await websocket.send(json.dumps(register_result))
+                        continue
+                    if msg_type == 'auth':
+                        auth_username = data.get('username')
+                        password = data.get('password')
+                        if not auth_username or not password:
+                            await websocket.send(json.dumps({
+                                "type": "error",
+                                "message": "Не указаны логин или пароль"
+                            }))
+                            continue
+                        auth_result = await self.authenticate_user(auth_username, password)
+                        if not auth_result['success']:
+                            await websocket.send(json.dumps({
+                                "type": "error",
+                                "message": auth_result['message']
+                            }))
+                            continue
+                        if auth_username in self.connected_clients:
+                            old_ws = self.connected_clients[auth_username]
+                            if old_ws is not websocket:
+                                try:
+                                    await old_ws.close(
+                                        code=websockets.frames.CloseCode.GOING_AWAY,
+                                        reason="Новое подключение с этим логином"
+                                    )
+                                except Exception as e:
+                                    logger.debug(f"Закрытие предыдущей сессии: {e}")
+                        username = auth_username
+                        self.connected_clients[username] = websocket
+                        logger.info(f"Пользователь {username} подключился")
                         await websocket.send(json.dumps({
-                            "type": "error",
-                            "message": "Неверный формат JSON"
+                            "type": "connected",
+                            "message": "Подключение к серверу SHIFT установлено",
+                            "username": username
                         }))
-                    except Exception as e:
-                        logger.error(f"Ошибка обработки сообщения: {e}")
-            
-            elif auth_data.get('type') == 'register':
-                username = auth_data.get('username')
-                password = auth_data.get('password')
-                
-                register_result = await self.register_user(username, password)
-                await websocket.send(json.dumps(register_result))
-                return
+                        continue
+                    await websocket.send(json.dumps({
+                        "type": "error",
+                        "message": "Ожидается вход (auth) или регистрация (register)"
+                    }))
+                    continue
+
+                try:
+                    await process_message(self, username, data)
+                except Exception as e:
+                    logger.error(f"Ошибка обработки сообщения: {e}")
         
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Соединение с клиентом закрыто")
         except Exception as e:
             logger.error(f"Ошибка обработки клиента: {e}")
         finally:
-            # Удаление клиента при отключении
-            if username and username in self.connected_clients:
+            # Удаляем только если в словаре всё ещё это соединение (иначе сработает
+            # старый обработчик после входа с того же логина с другого сокета).
+            if username and self.connected_clients.get(username) is websocket:
                 del self.connected_clients[username]
                 logger.info(f"Пользователь {username} отключился")
 
@@ -261,10 +299,17 @@ async def process_message(server: ShiftServer, sender: str, data: dict):
         content = data.get('content')
         
         if not receiver or not content:
+            logger.warning(f"Получено сообщение без получателя или содержимого от {sender}")
             return
+        
+        logger.info(f"Сообщение от {sender} к {receiver}: {content[:50]}...")
         
         # Сохранение в базу
         message_id = await server.save_message(sender, receiver, content)
+        
+        if message_id == -1:
+            logger.error(f"Не удалось сохранить сообщение от {sender} к {receiver}")
+            return
         
         # Отправка получателю
         await server.broadcast_to_user(receiver, {
@@ -284,6 +329,8 @@ async def process_message(server: ShiftServer, sender: str, data: dict):
             "content": content,
             "timestamp": datetime.now().isoformat()
         })
+        
+        logger.info(f"Сообщение {message_id} успешно отправлено")
     
     elif message_type == 'get_history':
         # Запрос истории сообщений
@@ -297,10 +344,14 @@ async def process_message(server: ShiftServer, sender: str, data: dict):
             })
     
     elif message_type == 'get_users':
-        # Запрос списка онлайн пользователей
+        # Запрос списка всех пользователей
+        all_users = await server.get_all_users()
+        online_users = list(server.connected_clients.keys())
+        
         await server.broadcast_to_user(sender, {
             "type": "users_list",
-            "users": list(server.connected_clients.keys())
+            "users": all_users,
+            "online": online_users
         })
 
 

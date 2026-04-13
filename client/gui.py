@@ -3,16 +3,198 @@ SHIFT Messenger GUI
 Графический интерфейс клиента мессенджера
 """
 
+import html
 import sys
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QTextEdit, QListWidget, QLabel,
-    QDialog, QFormLayout, QMessageBox, QSplitter, QFrame
+    QDialog, QFormLayout, QMessageBox, QSplitter,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QThread
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import Qt, pyqtSignal, QObject
+from PyQt5.QtGui import QFont
 from datetime import datetime
 from client.client import SyncShiftClient
+
+# Чёрно-синяя тёмная тема
+_THEME = {
+    'void': '#080b10',
+    'bg': '#0f1419',
+    'surface': '#141b26',
+    'elevated': '#1a2332',
+    'border': '#2a3a52',
+    'text': '#e8eef7',
+    'muted': '#7d92ad',
+    'blue': '#2f6feb',
+    'blue_hover': '#4a8ef7',
+    'blue_soft': '#3d5a80',
+    'accent_text': '#93c5fd',
+    'bubble_own': '#152a45',
+    'bubble_peer': '#161d2c',
+}
+
+
+def _login_dialog_stylesheet() -> str:
+    t = _THEME
+    return f"""
+        QDialog {{
+            background-color: {t['bg']};
+        }}
+        QLabel {{
+            color: {t['text']};
+        }}
+        QLineEdit {{
+            background-color: {t['surface']};
+            color: {t['text']};
+            border: 1px solid {t['border']};
+            border-radius: 6px;
+            padding: 8px;
+        }}
+        QLineEdit:focus {{
+            border: 1px solid {t['blue']};
+        }}
+        QPushButton {{
+            color: {t['text']};
+            padding: 10px;
+            border-radius: 6px;
+            font-size: 14px;
+            border: none;
+        }}
+        QPushButton:hover {{
+            background-color: {t['blue_hover']};
+        }}
+        QPushButton#loginPrimary {{
+            background-color: {t['blue']};
+        }}
+        QPushButton#loginPrimary:hover {{
+            background-color: {t['blue_hover']};
+        }}
+        QPushButton#loginSecondary {{
+            background-color: {t['elevated']};
+            border: 1px solid {t['blue_soft']};
+        }}
+        QPushButton#loginSecondary:hover {{
+            background-color: {t['surface']};
+            border: 1px solid {t['blue']};
+        }}
+    """
+
+
+def _main_window_stylesheet() -> str:
+    t = _THEME
+    return f"""
+        QMainWindow {{
+            background-color: {t['bg']};
+        }}
+        QWidget {{
+            color: {t['text']};
+        }}
+        QLabel {{
+            color: {t['text']};
+        }}
+        QListWidget {{
+            background-color: {t['surface']};
+            color: {t['text']};
+            border: 1px solid {t['border']};
+            border-radius: 6px;
+            padding: 6px;
+        }}
+        QListWidget::item {{
+            padding: 8px;
+            border-radius: 4px;
+        }}
+        QListWidget::item:hover {{
+            background-color: {t['elevated']};
+        }}
+        QListWidget::item:selected {{
+            background-color: {t['blue']};
+            color: {t['text']};
+        }}
+        QTextEdit {{
+            background-color: {t['void']};
+            color: {t['text']};
+            border: 1px solid {t['border']};
+            border-radius: 6px;
+            padding: 10px;
+        }}
+        QLineEdit {{
+            background-color: {t['surface']};
+            color: {t['text']};
+            border: 1px solid {t['border']};
+            border-radius: 6px;
+            padding: 10px;
+            font-size: 12px;
+        }}
+        QLineEdit:focus {{
+            border: 1px solid {t['blue']};
+        }}
+        QPushButton {{
+            color: {t['text']};
+            padding: 8px 14px;
+            border-radius: 6px;
+            border: none;
+        }}
+        QPushButton#actionRefresh {{
+            background-color: {t['blue']};
+        }}
+        QPushButton#actionRefresh:hover {{
+            background-color: {t['blue_hover']};
+        }}
+        QPushButton#actionLogout {{
+            background-color: {t['elevated']};
+            border: 1px solid {t['blue_soft']};
+        }}
+        QPushButton#actionLogout:hover {{
+            border: 1px solid {t['blue']};
+            background-color: {t['surface']};
+        }}
+        QPushButton#actionSend {{
+            background-color: {t['blue']};
+            padding: 10px 20px;
+        }}
+        QPushButton#actionSend:hover {{
+            background-color: {t['blue_hover']};
+        }}
+        QStatusBar {{
+            background-color: {t['surface']};
+            color: {t['muted']};
+            border-top: 1px solid {t['border']};
+        }}
+        QSplitter::handle {{
+            background-color: {t['border']};
+            width: 2px;
+        }}
+    """
+
+
+def _app_dialog_stylesheet() -> str:
+    t = _THEME
+    return f"""
+        QMessageBox {{
+            background-color: {t['surface']};
+        }}
+        QMessageBox QLabel {{
+            color: {t['text']};
+        }}
+        QMessageBox QPushButton {{
+            background-color: {t['blue']};
+            color: {t['text']};
+            padding: 6px 18px;
+            border-radius: 4px;
+            min-width: 72px;
+        }}
+        QMessageBox QPushButton:hover {{
+            background-color: {t['blue_hover']};
+        }}
+    """
+
+
+class SignalHandler(QObject):
+    """Обработчик сигналов для безопасного обновления GUI из другого потока"""
+    message_received = pyqtSignal(dict)
+    message_sent = pyqtSignal(dict)
+    history_received = pyqtSignal(dict)
+    users_list_received = pyqtSignal(dict)
+    error_received = pyqtSignal(dict)
 
 
 class LoginDialog(QDialog):
@@ -34,6 +216,7 @@ class LoginDialog(QDialog):
         title = QLabel('SHIFT Messenger')
         title.setFont(QFont('Arial', 20, QFont.Bold))
         title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f"color: {_THEME['accent_text']};")
         layout.addWidget(title)
         
         # Форма
@@ -54,40 +237,19 @@ class LoginDialog(QDialog):
         button_layout = QHBoxLayout()
         
         self.login_btn = QPushButton('Войти')
+        self.login_btn.setObjectName('loginPrimary')
         self.login_btn.clicked.connect(self.login)
-        self.login_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                padding: 10px;
-                border-radius: 5px;
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
         
         self.register_btn = QPushButton('Регистрация')
+        self.register_btn.setObjectName('loginSecondary')
         self.register_btn.clicked.connect(self.register)
-        self.register_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                padding: 10px;
-                border-radius: 5px;
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background-color: #0b7dda;
-            }
-        """)
         
         button_layout.addWidget(self.login_btn)
         button_layout.addWidget(self.register_btn)
         layout.addLayout(button_layout)
         
         self.setLayout(layout)
+        self.setStyleSheet(_login_dialog_stylesheet())
     
     def login(self):
         """Вход в систему"""
@@ -123,61 +285,6 @@ class LoginDialog(QDialog):
             QMessageBox.warning(self, 'Ошибка', result['message'])
 
 
-class ChatMessageWidget(QWidget):
-    """Виджет для отображения сообщения"""
-    
-    def __init__(self, sender: str, content: str, timestamp: str, is_own: bool = False):
-        super().__init__()
-        self.init_ui(sender, content, timestamp, is_own)
-    
-    def init_ui(self, sender: str, content: str, timestamp: str, is_own: bool):
-        layout = QVBoxLayout()
-        layout.setContentsMargins(10, 5, 10, 5)
-        
-        # Информация об отправителе и времени
-        info_layout = QHBoxLayout()
-        
-        sender_label = QLabel(sender)
-        sender_label.setFont(QFont('Arial', 10, QFont.Bold))
-        
-        time_label = QLabel(timestamp)
-        time_label.setStyleSheet('color: gray; font-size: 10px;')
-        
-        if is_own:
-            info_layout.addWidget(time_label)
-            info_layout.addStretch()
-            info_layout.addWidget(sender_label)
-        else:
-            info_layout.addWidget(sender_label)
-            info_layout.addStretch()
-            info_layout.addWidget(time_label)
-        
-        layout.addLayout(info_layout)
-        
-        # Текст сообщения
-        message_label = QLabel(content)
-        message_label.setWordWrap(True)
-        message_label.setStyleSheet(f"""
-            QLabel {{
-                background-color: {'#dcf8c6' if is_own else '#ffffff'};
-                padding: 10px;
-                border-radius: 10px;
-                border: 1px solid #e0e0e0;
-            }}
-        """)
-        
-        if is_own:
-            message_layout = QHBoxLayout()
-            message_layout.addStretch()
-            message_layout.addWidget(message_label)
-            message_layout.addStretch()
-            layout.addLayout(message_layout)
-        else:
-            layout.addWidget(message_label)
-        
-        self.setLayout(layout)
-
-
 class MainWindow(QMainWindow):
     """Главное окно мессенджера"""
     
@@ -187,8 +294,10 @@ class MainWindow(QMainWindow):
         self.username = username
         self.current_chat = None
         self.messages = []
+        self.signal_handler = SignalHandler()
         self.init_ui()
         self.setup_handlers()
+        self.setup_signal_connections()
     
     def init_ui(self):
         self.setWindowTitle(f'SHIFT - {self.username}')
@@ -218,41 +327,18 @@ class MainWindow(QMainWindow):
         # Список пользователей
         self.users_list = QListWidget()
         self.users_list.itemClicked.connect(self.select_user)
-        self.users_list.setStyleSheet("""
-            QListWidget {
-                border: 1px solid #e0e0e0;
-                border-radius: 5px;
-                padding: 5px;
-            }
-            QListWidget::item {
-                padding: 8px;
-                border-radius: 3px;
-            }
-            QListWidget::item:hover {
-                background-color: #f0f0f0;
-            }
-            QListWidget::item:selected {
-                background-color: #4CAF50;
-                color: white;
-            }
-        """)
         left_layout.addWidget(self.users_list)
         
         # Кнопка обновления списка
         refresh_btn = QPushButton('Обновить список')
+        refresh_btn.setObjectName('actionRefresh')
         refresh_btn.clicked.connect(self.refresh_users)
-        refresh_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #2196F3;
-                color: white;
-                padding: 8px;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #0b7dda;
-            }
-        """)
         left_layout.addWidget(refresh_btn)
+
+        self.logout_btn = QPushButton('Выйти из аккаунта')
+        self.logout_btn.setObjectName('actionLogout')
+        self.logout_btn.clicked.connect(self.logout_from_account)
+        left_layout.addWidget(self.logout_btn)
         
         # Правая панель - чат
         right_panel = QWidget()
@@ -267,14 +353,6 @@ class MainWindow(QMainWindow):
         # Область сообщений
         self.messages_area = QTextEdit()
         self.messages_area.setReadOnly(True)
-        self.messages_area.setStyleSheet("""
-            QTextEdit {
-                border: 1px solid #e0e0e0;
-                border-radius: 5px;
-                padding: 10px;
-                background-color: #f5f5f5;
-            }
-        """)
         right_layout.addWidget(self.messages_area)
         
         # Поле ввода сообщения
@@ -283,29 +361,11 @@ class MainWindow(QMainWindow):
         self.message_input = QLineEdit()
         self.message_input.setPlaceholderText('Введите сообщение...')
         self.message_input.returnPressed.connect(self.send_message)
-        self.message_input.setStyleSheet("""
-            QLineEdit {
-                padding: 10px;
-                border: 1px solid #e0e0e0;
-                border-radius: 5px;
-                font-size: 12px;
-            }
-        """)
         input_layout.addWidget(self.message_input)
         
         send_btn = QPushButton('Отправить')
+        send_btn.setObjectName('actionSend')
         send_btn.clicked.connect(self.send_message)
-        send_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                padding: 10px 20px;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-        """)
         input_layout.addWidget(send_btn)
         
         right_layout.addLayout(input_layout)
@@ -319,20 +379,142 @@ class MainWindow(QMainWindow):
         
         # Статус бар
         self.statusBar().showMessage('Подключено к серверу')
+        self.setStyleSheet(_main_window_stylesheet())
     
     def setup_handlers(self):
         """Настройка обработчиков событий"""
-        self.client.on('message', self.handle_message)
-        self.client.on('message_sent', self.handle_message_sent)
-        self.client.on('history', self.handle_history)
-        self.client.on('users_list', self.handle_users_list)
-        self.client.on('error', self.handle_error)
+        self.client.on('message', lambda data: self.signal_handler.message_received.emit(data))
+        self.client.on('message_sent', lambda data: self.signal_handler.message_sent.emit(data))
+        self.client.on('history', lambda data: self.signal_handler.history_received.emit(data))
+        self.client.on('users_list', lambda data: self.signal_handler.users_list_received.emit(data))
+        self.client.on('error', lambda data: self.signal_handler.error_received.emit(data))
         
         # Запрос списка пользователей при запуске
         self.client.get_users_list()
     
+    def setup_signal_connections(self):
+        """Подключение сигналов к слотам"""
+        self.signal_handler.message_received.connect(self._handle_message_safe)
+        self.signal_handler.message_sent.connect(self._handle_message_sent_safe)
+        self.signal_handler.history_received.connect(self._handle_history_safe)
+        self.signal_handler.users_list_received.connect(self._handle_users_list_safe)
+        self.signal_handler.error_received.connect(self._handle_error_safe)
+    
+    def _handle_message_safe(self, data: dict):
+        """Безопасная обработка входящего сообщения"""
+        sender = data.get('sender')
+        content = data.get('content')
+        timestamp = data.get('timestamp', '')
+        
+        # Форматирование времени
+        try:
+            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            formatted_time = dt.strftime('%H:%M')
+        except (ValueError, TypeError):
+            formatted_time = str(timestamp) if timestamp else ''
+        
+        # Если сообщение от текущего пользователя чата
+        if sender == self.current_chat:
+            self.add_message_to_chat(sender, content, formatted_time, is_own=False)
+        else:
+            # Уведомление о новом сообщении
+            self.statusBar().showMessage(f'Новое сообщение от {sender}', 3000)
+    
+    def _handle_message_sent_safe(self, data: dict):
+        """Безопасная обработка подтверждения отправки"""
+        receiver = data.get('receiver')
+        content = data.get('content')
+        timestamp = data.get('timestamp', '')
+        
+        if receiver == self.current_chat:
+            try:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                formatted_time = dt.strftime('%H:%M')
+            except (ValueError, TypeError):
+                formatted_time = str(timestamp) if timestamp else ''
+            
+            self.add_message_to_chat(self.username, content, formatted_time, is_own=True)
+    
+    def _handle_history_safe(self, data: dict):
+        """Безопасная обработка истории сообщений"""
+        messages = data.get('messages', [])
+        
+        # Очистка и отображение истории
+        self.messages_area.clear()
+        
+        # Сообщения приходят в обратном порядке
+        for msg in reversed(messages):
+            sender = msg.get('sender')
+            content = msg.get('content')
+            timestamp = msg.get('timestamp', '')
+            
+            try:
+                dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                formatted_time = dt.strftime('%H:%M')
+            except (ValueError, TypeError):
+                formatted_time = str(timestamp) if timestamp else ''
+            
+            is_own = (sender == self.username)
+            self.add_message_to_chat(sender, content, formatted_time, is_own)
+    
+    def _handle_users_list_safe(self, data: dict):
+        """Безопасная обработка списка пользователей"""
+        users = data.get('users', [])
+        
+        self.users_list.clear()
+        for user in users:
+            if user != self.username:  # Не показывать себя
+                self.users_list.addItem(user)
+    
+    def _handle_error_safe(self, data: dict):
+        """Безопасная обработка ошибок"""
+        message = data.get('message', 'Неизвестная ошибка')
+        QMessageBox.warning(self, 'Ошибка', message)
+    
     def refresh_users(self):
         """Обновление списка пользователей"""
+        self.client.get_users_list()
+
+    def logout_from_account(self):
+        """Выход из аккаунта с сохранением подключения к серверу для повторного входа"""
+        reply = QMessageBox.question(
+            self,
+            'Выход из аккаунта',
+            'Выйти из аккаунта? Сообщения на экране будут очищены.',
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.client.disconnect()
+        if not self.client.connect():
+            QMessageBox.critical(
+                self,
+                'Ошибка',
+                'Не удалось снова подключиться к серверу. Приложение будет закрыто.',
+            )
+            self.client.stop_event_loop()
+            self.close()
+            return
+
+        login_dialog = LoginDialog(self.client)
+        if login_dialog.exec_() != QDialog.Accepted:
+            self.client.disconnect()
+            self.client.stop_event_loop()
+            self.close()
+            QApplication.instance().quit()
+            return
+
+        self.username = login_dialog.username
+        self.setWindowTitle(f'SHIFT - {self.username}')
+        self.current_chat = None
+        self.messages = []
+        self.users_list.clear()
+        self.messages_area.clear()
+        self.chat_header.setText('Выберите чат')
+        self.message_input.clear()
+        self.statusBar().showMessage('Подключено к серверу')
         self.client.get_users_list()
     
     def select_user(self, item):
@@ -358,95 +540,33 @@ class MainWindow(QMainWindow):
         self.client.send_message(self.current_chat, content)
         self.message_input.clear()
     
-    def handle_message(self, data: dict):
-        """Обработка входящего сообщения"""
-        sender = data.get('sender')
-        content = data.get('content')
-        timestamp = data.get('timestamp', '')
-        
-        # Форматирование времени
-        try:
-            dt = datetime.fromisoformat(timestamp)
-            formatted_time = dt.strftime('%H:%M')
-        except:
-            formatted_time = timestamp
-        
-        # Если сообщение от текущего пользователя чата
-        if sender == self.current_chat:
-            self.add_message_to_chat(sender, content, formatted_time, is_own=False)
-        else:
-            # Уведомление о новом сообщении
-            self.statusBar().showMessage(f'Новое сообщение от {sender}', 3000)
-    
-    def handle_message_sent(self, data: dict):
-        """Обработка подтверждения отправки"""
-        receiver = data.get('receiver')
-        content = data.get('content')
-        timestamp = data.get('timestamp', '')
-        
-        if receiver == self.current_chat:
-            try:
-                dt = datetime.fromisoformat(timestamp)
-                formatted_time = dt.strftime('%H:%M')
-            except:
-                formatted_time = timestamp
-            
-            self.add_message_to_chat(self.username, content, formatted_time, is_own=True)
-    
-    def handle_history(self, data: dict):
-        """Обработка истории сообщений"""
-        messages = data.get('messages', [])
-        
-        # Очистка и отображение истории
-        self.messages_area.clear()
-        
-        # Сообщения приходят в обратном порядке
-        for msg in reversed(messages):
-            sender = msg.get('sender')
-            content = msg.get('content')
-            timestamp = msg.get('timestamp', '')
-            
-            try:
-                dt = datetime.fromisoformat(timestamp)
-                formatted_time = dt.strftime('%H:%M')
-            except:
-                formatted_time = timestamp
-            
-            is_own = (sender == self.username)
-            self.add_message_to_chat(sender, content, formatted_time, is_own)
-    
-    def handle_users_list(self, data: dict):
-        """Обработка списка пользователей"""
-        users = data.get('users', [])
-        
-        self.users_list.clear()
-        for user in users:
-            if user != self.username:  # Не показывать себя
-                self.users_list.addItem(user)
-    
-    def handle_error(self, data: dict):
-        """Обработка ошибок"""
-        message = data.get('message', 'Неизвестная ошибка')
-        QMessageBox.warning(self, 'Ошибка', message)
-    
     def add_message_to_chat(self, sender: str, content: str, timestamp: str, is_own: bool):
-        """Добавление сообщения в область чата"""
-        html = f"""
-        <div style="margin: 5px 0;">
-            <span style="font-weight: bold; color: {'#4CAF50' if is_own else '#2196F3'};">{sender}</span>
-            <span style="color: gray; font-size: 10px;">{timestamp}</span>
-        </div>
-        <div style="background-color: {'#dcf8c6' if is_own else '#ffffff'}; 
-                    padding: 10px; 
-                    border-radius: 10px; 
-                    margin: 5px 0;
-                    border: 1px solid #e0e0e0;
-                    {'margin-left: 50px;' if is_own else 'margin-right: 50px;'}">
-            {content}
+        """Добавление сообщения в область чата: сначала имя отправителя, ниже текст сообщения."""
+        t = _THEME
+        name_color = '#7dd3fc' if is_own else t['accent_text']
+        bubble_bg = t['bubble_own'] if is_own else t['bubble_peer']
+        border_color = '#2563eb' if is_own else t['border']
+        side_margin = 'margin-left: 50px;' if is_own else 'margin-right: 50px;'
+        safe_sender = html.escape(sender or '', quote=True)
+        safe_content = html.escape(content or '', quote=True).replace('\n', '<br/>')
+        safe_time = html.escape(timestamp or '', quote=True)
+        block = f"""
+        <div style="margin: 10px 0;">
+            <div style="font-weight: bold; color: {name_color}; margin-bottom: 4px;">
+                {safe_sender}
+                <span style="color: {t['muted']}; font-weight: normal; font-size: 10px; margin-left: 8px;">{safe_time}</span>
+            </div>
+            <div style="background-color: {bubble_bg};
+                        color: {t['text']};
+                        padding: 10px;
+                        border-radius: 10px;
+                        border: 1px solid {border_color};
+                        {side_margin}">
+                {safe_content}
+            </div>
         </div>
         """
-        
-        self.messages_area.insertHtml(html)
+        self.messages_area.insertHtml(block)
         # Прокрутка вниз
         scrollbar = self.messages_area.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
@@ -456,11 +576,13 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(
             self, 'Выход',
             'Вы уверены, что хотите выйти?',
-            QMessageBox.Yes | QMessageBox.No
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
         )
         
         if reply == QMessageBox.Yes:
             self.client.disconnect()
+            self.client.stop_event_loop()
             event.accept()
         else:
             event.ignore()
@@ -470,17 +592,19 @@ def main():
     """Запуск приложения"""
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
+    app.setStyleSheet(_app_dialog_stylesheet())
     
     # Создание клиента
     client = SyncShiftClient()
     
+    # Запуск цикла событий ДО подключения
+    client.start_event_loop()
+    
     # Подключение к серверу
     if not client.connect():
         QMessageBox.critical(None, 'Ошибка', 'Не удалось подключиться к серверу')
+        client.stop_event_loop()
         sys.exit(1)
-    
-    # Запуск цикла событий
-    client.start_event_loop()
     
     # Диалог входа
     login_dialog = LoginDialog(client)
@@ -491,6 +615,7 @@ def main():
         sys.exit(app.exec_())
     else:
         client.disconnect()
+        client.stop_event_loop()
         sys.exit(0)
 
 

@@ -14,7 +14,7 @@ class ShiftClient:
     """Клиент мессенджера SHIFT"""
     
     def __init__(self):
-        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
+        self.websocket: Optional[websockets.ClientConnection] = None
         self.username: Optional[str] = None
         self.connected = False
         self.message_handlers = {
@@ -25,6 +25,7 @@ class ShiftClient:
             'connected': [],
             'error': []
         }
+        self._response_queue = None
     
     def on(self, event_type: str, callback: Callable):
         """Регистрация обработчика событий"""
@@ -46,6 +47,7 @@ class ShiftClient:
             uri = f"ws://{host}:{port}"
             self.websocket = await websockets.connect(uri)
             self.connected = True
+            self._response_queue = asyncio.Queue()
             print(f"Подключено к {uri}")
             
             # Запуск прослушивания сообщений
@@ -53,14 +55,22 @@ class ShiftClient:
             return True
         except Exception as e:
             print(f"Ошибка подключения: {e}")
+            self.websocket = None
+            self._response_queue = None
+            self.connected = False
             return False
     
     async def disconnect(self):
         """Отключение от сервера"""
         if self.websocket:
-            await self.websocket.close()
+            try:
+                await self.websocket.close()
+            except Exception:
+                pass
+            self.websocket = None
             self.connected = False
             self.username = None
+            self._response_queue = None
             print("Отключено от сервера")
     
     async def register(self, username: str, password: str) -> dict:
@@ -76,9 +86,12 @@ class ShiftClient:
         
         await self.websocket.send(json.dumps(message))
         
-        # Ждем ответа
-        response = await self.websocket.recv()
-        return json.loads(response)
+        # Ждем ответа через очередь
+        try:
+            response = await asyncio.wait_for(self._response_queue.get(), timeout=10)
+            return response
+        except asyncio.TimeoutError:
+            return {"success": False, "message": "Таймаут ожидания ответа"}
     
     async def login(self, username: str, password: str) -> dict:
         """Вход в систему"""
@@ -93,17 +106,19 @@ class ShiftClient:
         
         await self.websocket.send(json.dumps(message))
         
-        # Ждем ответа
-        response = await self.websocket.recv()
-        data = json.loads(response)
-        
-        if data.get('type') == 'connected':
-            self.username = username
-            return {"success": True, "message": "Вход выполнен успешно"}
-        elif data.get('type') == 'error':
-            return {"success": False, "message": data.get('message')}
-        
-        return {"success": False, "message": "Неизвестный ответ сервера"}
+        # Ждем ответа через очередь
+        try:
+            data = await asyncio.wait_for(self._response_queue.get(), timeout=10)
+            
+            if data.get('type') == 'connected':
+                self.username = username
+                return {"success": True, "message": "Вход выполнен успешно"}
+            elif data.get('type') == 'error':
+                return {"success": False, "message": data.get('message')}
+            
+            return {"success": False, "message": "Неизвестный ответ сервера"}
+        except asyncio.TimeoutError:
+            return {"success": False, "message": "Таймаут ожидания ответа"}
     
     async def send_message(self, receiver: str, content: str):
         """Отправка сообщения"""
@@ -117,7 +132,9 @@ class ShiftClient:
             "content": content
         }
         
+        print(f"Отправка сообщения: {message}")
         await self.websocket.send(json.dumps(message))
+        print("Сообщение отправлено на сервер")
     
     async def get_history(self, user: str):
         """Запрос истории сообщений с пользователем"""
@@ -151,6 +168,17 @@ class ShiftClient:
                 try:
                     data = json.loads(message)
                     message_type = data.get('type')
+                    print(f"Получено сообщение типа: {message_type}, данные: {data}")
+                    
+                    # Для register и login помещаем ответ в очередь
+                    if message_type in ('register', 'connected', 'error') and self._response_queue:
+                        try:
+                            self._response_queue.put_nowait(data)
+                            print(f"Помещено в очередь: {message_type}")
+                        except Exception as e:
+                            print(f"Ошибка помещения в очередь: {e}")
+                    
+                    # Вызываем обработчики событий
                     self._emit(message_type, data)
                 except json.JSONDecodeError:
                     print("Ошибка декодирования JSON")
@@ -173,12 +201,22 @@ class SyncShiftClient:
         self.client = ShiftClient()
         self.loop = asyncio.new_event_loop()
         self._running = False
+        self._thread = None
     
     def connect(self, host: str = 'localhost', port: int = 8765) -> bool:
         """Подключение к серверу"""
         try:
-            result = self.loop.run_until_complete(self.client.connect(host, port))
-            return result
+            if self._running:
+                # Если цикл уже запущен, используем run_coroutine_threadsafe
+                future = asyncio.run_coroutine_threadsafe(
+                    self.client.connect(host, port),
+                    self.loop
+                )
+                return future.result(timeout=10)
+            else:
+                # Если цикл не запущен, используем run_until_complete
+                result = self.loop.run_until_complete(self.client.connect(host, port))
+                return result
         except Exception as e:
             print(f"Ошибка подключения: {e}")
             return False
@@ -186,21 +224,41 @@ class SyncShiftClient:
     def disconnect(self):
         """Отключение от сервера"""
         try:
-            self.loop.run_until_complete(self.client.disconnect())
+            if self._running:
+                asyncio.run_coroutine_threadsafe(
+                    self.client.disconnect(),
+                    self.loop
+                ).result(timeout=5)
+            else:
+                self.loop.run_until_complete(self.client.disconnect())
         except Exception as e:
             print(f"Ошибка отключения: {e}")
     
     def register(self, username: str, password: str) -> dict:
         """Регистрация нового пользователя"""
         try:
-            return self.loop.run_until_complete(self.client.register(username, password))
+            if self._running:
+                future = asyncio.run_coroutine_threadsafe(
+                    self.client.register(username, password),
+                    self.loop
+                )
+                return future.result(timeout=10)
+            else:
+                return self.loop.run_until_complete(self.client.register(username, password))
         except Exception as e:
             return {"success": False, "message": str(e)}
     
     def login(self, username: str, password: str) -> dict:
         """Вход в систему"""
         try:
-            return self.loop.run_until_complete(self.client.login(username, password))
+            if self._running:
+                future = asyncio.run_coroutine_threadsafe(
+                    self.client.login(username, password),
+                    self.loop
+                )
+                return future.result(timeout=10)
+            else:
+                return self.loop.run_until_complete(self.client.login(username, password))
         except Exception as e:
             return {"success": False, "message": str(e)}
     
@@ -254,12 +312,16 @@ class SyncShiftClient:
         self._running = True
         
         def run_loop():
-            while self._running:
-                self.loop.run_until_complete(asyncio.sleep(0.1))
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_forever()
         
-        thread = threading.Thread(target=run_loop, daemon=True)
-        thread.start()
+        self._thread = threading.Thread(target=run_loop, daemon=True)
+        self._thread.start()
     
     def stop_event_loop(self):
         """Остановка цикла событий"""
         self._running = False
+        if self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
