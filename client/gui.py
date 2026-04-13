@@ -3,15 +3,20 @@ SHIFT Messenger GUI
 Графический интерфейс клиента мессенджера
 """
 
-import html
+import os
 import sys
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLineEdit, QTextEdit, QListWidget, QLabel,
-    QDialog, QFormLayout, QMessageBox, QSplitter,
+    QPushButton, QLineEdit, QListWidget, QListWidgetItem, QLabel,
+    QDialog, QFormLayout, QMessageBox, QSplitter, QComboBox, QFrame, QScrollArea, QTextEdit,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QObject
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QEvent, QTimer
+
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+from statuses import USER_STATUS_CHOICES
+from PyQt5.QtGui import QFont, QColor, QBrush, QTextOption
 from datetime import datetime
 from client.client import SyncShiftClient
 
@@ -30,6 +35,7 @@ _THEME = {
     'accent_text': '#93c5fd',
     'bubble_own': '#152a45',
     'bubble_peer': '#161d2c',
+    'unread_badge': '#f97316',
 }
 
 
@@ -109,12 +115,13 @@ def _main_window_stylesheet() -> str:
             background-color: {t['blue']};
             color: {t['text']};
         }}
-        QTextEdit {{
+        QScrollArea#messagesScroll {{
             background-color: {t['void']};
-            color: {t['text']};
             border: 1px solid {t['border']};
             border-radius: 6px;
-            padding: 10px;
+        }}
+        QScrollArea#messagesScroll > QWidget > QWidget {{
+            background-color: {t['void']};
         }}
         QLineEdit {{
             background-color: {t['surface']};
@@ -163,6 +170,27 @@ def _main_window_stylesheet() -> str:
             background-color: {t['border']};
             width: 2px;
         }}
+        QComboBox {{
+            background-color: {t['surface']};
+            color: {t['text']};
+            border: 1px solid {t['border']};
+            border-radius: 6px;
+            padding: 8px 10px;
+            min-height: 20px;
+        }}
+        QComboBox:hover {{
+            border: 1px solid {t['blue_soft']};
+        }}
+        QComboBox::drop-down {{
+            border: none;
+            width: 28px;
+        }}
+        QComboBox QAbstractItemView {{
+            background-color: {t['elevated']};
+            color: {t['text']};
+            selection-background-color: {t['blue']};
+            border: 1px solid {t['border']};
+        }}
     """
 
 
@@ -194,6 +222,8 @@ class SignalHandler(QObject):
     message_sent = pyqtSignal(dict)
     history_received = pyqtSignal(dict)
     users_list_received = pyqtSignal(dict)
+    user_status_received = pyqtSignal(dict)
+    unread_counts_received = pyqtSignal(dict)
     error_received = pyqtSignal(dict)
 
 
@@ -294,6 +324,9 @@ class MainWindow(QMainWindow):
         self.username = username
         self.current_chat = None
         self.messages = []
+        self.peer_statuses: dict = {}
+        self._users_order: list = []
+        self.unread_counts: dict = {}
         self.signal_handler = SignalHandler()
         self.init_ui()
         self.setup_handlers()
@@ -320,9 +353,20 @@ class MainWindow(QMainWindow):
         left_panel.setLayout(left_layout)
         
         # Заголовок списка
-        users_header = QLabel('Пользователи')
-        users_header.setFont(QFont('Arial', 14, QFont.Bold))
-        left_layout.addWidget(users_header)
+        self.users_header = QLabel('Пользователи')
+        self.users_header.setFont(QFont('Arial', 14, QFont.Bold))
+        left_layout.addWidget(self.users_header)
+        
+        status_row = QHBoxLayout()
+        status_row.addWidget(QLabel('Мой статус:'))
+        self.status_combo = QComboBox()
+        self.status_combo.addItems(list(USER_STATUS_CHOICES))
+        self.status_combo.blockSignals(True)
+        self.status_combo.setCurrentText(self.client.get_current_status())
+        self.status_combo.blockSignals(False)
+        self.status_combo.currentTextChanged.connect(self._on_my_status_changed)
+        status_row.addWidget(self.status_combo, stretch=1)
+        left_layout.addLayout(status_row)
         
         # Список пользователей
         self.users_list = QListWidget()
@@ -350,10 +394,20 @@ class MainWindow(QMainWindow):
         self.chat_header.setFont(QFont('Arial', 14, QFont.Bold))
         right_layout.addWidget(self.chat_header)
         
-        # Область сообщений
-        self.messages_area = QTextEdit()
-        self.messages_area.setReadOnly(True)
-        right_layout.addWidget(self.messages_area)
+        # Область сообщений: QScrollArea + QFrame (скругление в стилях Qt, не HTML в QTextEdit)
+        self.messages_scroll = QScrollArea()
+        self.messages_scroll.setObjectName('messagesScroll')
+        self.messages_scroll.setWidgetResizable(True)
+        self.messages_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.messages_scroll.setFrameShape(QFrame.NoFrame)
+        self.messages_container = QWidget()
+        self.messages_layout = QVBoxLayout(self.messages_container)
+        self.messages_layout.setContentsMargins(8, 8, 8, 8)
+        self.messages_layout.setSpacing(6)
+        self.messages_scroll.setWidget(self.messages_container)
+        right_layout.addWidget(self.messages_scroll, stretch=1)
+        self.messages_viewport = self.messages_scroll.viewport()
+        self.messages_viewport.installEventFilter(self)
         
         # Поле ввода сообщения
         input_layout = QHBoxLayout()
@@ -387,6 +441,8 @@ class MainWindow(QMainWindow):
         self.client.on('message_sent', lambda data: self.signal_handler.message_sent.emit(data))
         self.client.on('history', lambda data: self.signal_handler.history_received.emit(data))
         self.client.on('users_list', lambda data: self.signal_handler.users_list_received.emit(data))
+        self.client.on('user_status', lambda data: self.signal_handler.user_status_received.emit(data))
+        self.client.on('unread_counts', lambda data: self.signal_handler.unread_counts_received.emit(data))
         self.client.on('error', lambda data: self.signal_handler.error_received.emit(data))
         
         # Запрос списка пользователей при запуске
@@ -398,6 +454,8 @@ class MainWindow(QMainWindow):
         self.signal_handler.message_sent.connect(self._handle_message_sent_safe)
         self.signal_handler.history_received.connect(self._handle_history_safe)
         self.signal_handler.users_list_received.connect(self._handle_users_list_safe)
+        self.signal_handler.user_status_received.connect(self._handle_user_status_safe)
+        self.signal_handler.unread_counts_received.connect(self._handle_unread_counts_safe)
         self.signal_handler.error_received.connect(self._handle_error_safe)
     
     def _handle_message_safe(self, data: dict):
@@ -416,6 +474,7 @@ class MainWindow(QMainWindow):
         # Если сообщение от текущего пользователя чата
         if sender == self.current_chat:
             self.add_message_to_chat(sender, content, formatted_time, is_own=False)
+            self.client.mark_read(sender)
         else:
             # Уведомление о новом сообщении
             self.statusBar().showMessage(f'Новое сообщение от {sender}', 3000)
@@ -440,7 +499,7 @@ class MainWindow(QMainWindow):
         messages = data.get('messages', [])
         
         # Очистка и отображение истории
-        self.messages_area.clear()
+        self._clear_messages_layout()
         
         # Сообщения приходят в обратном порядке
         for msg in reversed(messages):
@@ -460,11 +519,33 @@ class MainWindow(QMainWindow):
     def _handle_users_list_safe(self, data: dict):
         """Безопасная обработка списка пользователей"""
         users = data.get('users', [])
-        
-        self.users_list.clear()
-        for user in users:
-            if user != self.username:  # Не показывать себя
-                self.users_list.addItem(user)
+        self._users_order = [u for u in users if u != self.username]
+        for u, st in (data.get('statuses') or {}).items():
+            self.peer_statuses[u] = st
+        self.unread_counts = {
+            str(k): int(v)
+            for k, v in (data.get('unread_counts') or {}).items()
+        }
+        self._render_users_list()
+    
+    def _handle_unread_counts_safe(self, data: dict):
+        """Обновление счётчиков непрочитанных с сервера."""
+        self.unread_counts = {
+            str(k): int(v)
+            for k, v in (data.get('counts') or {}).items()
+        }
+        self._render_users_list()
+    
+    def _handle_user_status_safe(self, data: dict):
+        """Обновление статуса контакта в реальном времени."""
+        u = data.get('user')
+        st = data.get('status')
+        if u is None or st is None:
+            return
+        self.peer_statuses[u] = st
+        if u == self.username:
+            self._sync_status_combo(self.client.get_current_status())
+        self._render_users_list()
     
     def _handle_error_safe(self, data: dict):
         """Безопасная обработка ошибок"""
@@ -474,6 +555,47 @@ class MainWindow(QMainWindow):
     def refresh_users(self):
         """Обновление списка пользователей"""
         self.client.get_users_list()
+    
+    def _sync_status_combo(self, status: str):
+        self.status_combo.blockSignals(True)
+        idx = self.status_combo.findText(status)
+        if idx >= 0:
+            self.status_combo.setCurrentIndex(idx)
+        self.status_combo.blockSignals(False)
+    
+    def _on_my_status_changed(self, status: str):
+        if not status:
+            return
+        self.client.set_status(status)
+    
+    def _update_users_header_badge(self):
+        total = sum(self.unread_counts.values())
+        if total:
+            self.users_header.setText(f'Пользователи · {total} непрочит.')
+        else:
+            self.users_header.setText('Пользователи')
+    
+    def _render_users_list(self):
+        self.users_list.blockSignals(True)
+        self.users_list.clear()
+        for u in self._users_order:
+            st = self.peer_statuses.get(u, 'не в сети')
+            n_unread = int(self.unread_counts.get(u, 0))
+            badge = f'  [{n_unread} непр.]' if n_unread > 0 else ''
+            label = f"{u} — {st}{badge}"
+            it = QListWidgetItem(label)
+            it.setData(Qt.UserRole, u)
+            if n_unread > 0:
+                it.setForeground(QBrush(QColor(_THEME['unread_badge'])))
+            self.users_list.addItem(it)
+        if self.current_chat:
+            for i in range(self.users_list.count()):
+                row = self.users_list.item(i)
+                if row and row.data(Qt.UserRole) == self.current_chat:
+                    self.users_list.setCurrentRow(i)
+                    break
+        self.users_list.blockSignals(False)
+        self._update_users_header_badge()
 
     def logout_from_account(self):
         """Выход из аккаунта с сохранением подключения к серверу для повторного входа"""
@@ -510,18 +632,23 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f'SHIFT - {self.username}')
         self.current_chat = None
         self.messages = []
+        self.peer_statuses.clear()
+        self._users_order.clear()
+        self.unread_counts.clear()
         self.users_list.clear()
-        self.messages_area.clear()
+        self._clear_messages_layout()
         self.chat_header.setText('Выберите чат')
         self.message_input.clear()
+        self._sync_status_combo(self.client.get_current_status())
         self.statusBar().showMessage('Подключено к серверу')
         self.client.get_users_list()
     
     def select_user(self, item):
         """Выбор пользователя для чата"""
-        self.current_chat = item.text()
+        name = item.data(Qt.UserRole)
+        self.current_chat = name if name is not None else item.text().split(' — ')[0]
         self.chat_header.setText(f'Чат с {self.current_chat}')
-        self.messages_area.clear()
+        self._clear_messages_layout()
         self.messages = []
         
         # Запрос истории сообщений
@@ -540,36 +667,123 @@ class MainWindow(QMainWindow):
         self.client.send_message(self.current_chat, content)
         self.message_input.clear()
     
+    def eventFilter(self, obj, event):
+        if getattr(self, 'messages_viewport', None) is obj and event.type() == QEvent.Resize:
+            self._apply_bubble_max_widths()
+        return super().eventFilter(obj, event)
+    
+    def _max_bubble_width(self) -> int:
+        if not getattr(self, 'messages_scroll', None):
+            return 400
+        return max(200, int(self.messages_scroll.viewport().width() * 0.75))
+    
+    def _apply_bubble_max_widths(self):
+        mw = self._max_bubble_width()
+        for frame in self.messages_container.findChildren(QFrame):
+            if frame.objectName() == 'chatBubble':
+                frame.setMaximumWidth(mw)
+        QTimer.singleShot(0, self._reflow_message_bodies)
+    
+    def _sync_msg_body_height(self, body: QTextEdit):
+        """Перенос по символам + высота под содержимое после смены ширины."""
+        w = body.viewport().width()
+        if w <= 0:
+            return
+        body.document().setTextWidth(w)
+        margins = body.contentsMargins()
+        extra = body.frameWidth() * 2 + 4
+        h = int(body.document().size().height()) + margins.top() + margins.bottom() + extra
+        body.setFixedHeight(max(h, 28))
+    
+    def _reflow_message_bodies(self):
+        for body in self.messages_container.findChildren(QTextEdit):
+            if body.objectName() == 'msgBody':
+                self._sync_msg_body_height(body)
+    
+    def _clear_messages_layout(self):
+        while self.messages_layout.count():
+            item = self.messages_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+    
+    def _scroll_messages_to_bottom(self):
+        bar = self.messages_scroll.verticalScrollBar()
+        QTimer.singleShot(0, lambda b=bar: b.setValue(b.maximum()))
+    
     def add_message_to_chat(self, sender: str, content: str, timestamp: str, is_own: bool):
-        """Добавление сообщения в область чата: сначала имя отправителя, ниже текст сообщения."""
+        """Пузырь из QFrame + stylesheet: скругление реально рисуется Qt. Ширина до 75% поля; свои справа."""
         t = _THEME
-        name_color = '#7dd3fc' if is_own else t['accent_text']
+        name_hex = '#7dd3fc' if is_own else t['accent_text']
         bubble_bg = t['bubble_own'] if is_own else t['bubble_peer']
-        border_color = '#2563eb' if is_own else t['border']
-        side_margin = 'margin-left: 50px;' if is_own else 'margin-right: 50px;'
-        safe_sender = html.escape(sender or '', quote=True)
-        safe_content = html.escape(content or '', quote=True).replace('\n', '<br/>')
-        safe_time = html.escape(timestamp or '', quote=True)
-        block = f"""
-        <div style="margin: 10px 0;">
-            <div style="font-weight: bold; color: {name_color}; margin-bottom: 4px;">
-                {safe_sender}
-                <span style="color: {t['muted']}; font-weight: normal; font-size: 10px; margin-left: 8px;">{safe_time}</span>
-            </div>
-            <div style="background-color: {bubble_bg};
-                        color: {t['text']};
-                        padding: 10px;
-                        border-radius: 10px;
-                        border: 1px solid {border_color};
-                        {side_margin}">
-                {safe_content}
-            </div>
-        </div>
-        """
-        self.messages_area.insertHtml(block)
-        # Прокрутка вниз
-        scrollbar = self.messages_area.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        border_c = '#2563eb' if is_own else t['border']
+
+        bubble = QFrame()
+        bubble.setObjectName('chatBubble')
+        bubble.setAttribute(Qt.WA_StyledBackground, True)
+        bubble.setStyleSheet(f"""
+            QFrame#chatBubble {{
+                background-color: {bubble_bg};
+                border: 1px solid {border_c};
+                border-radius: 40px;
+            }}
+        """)
+
+        inner = QVBoxLayout(bubble)
+        inner.setContentsMargins(22, 18, 22, 20)
+        inner.setSpacing(10)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        name_lbl = QLabel(sender or '')
+        name_lbl.setStyleSheet(f'color: {name_hex}; font-weight: 600; font-size: 13px;')
+        time_lbl = QLabel(str(timestamp or ''))
+        time_lbl.setStyleSheet(f"color: {t['muted']}; font-size: 11px;")
+        head.addWidget(name_lbl, 0, Qt.AlignLeft | Qt.AlignVCenter)
+        head.addWidget(time_lbl, 0, Qt.AlignLeft | Qt.AlignVCenter)
+        head.addStretch(1)
+        head_w = QWidget()
+        head_w.setLayout(head)
+        head_w.setStyleSheet('background: transparent;')
+        inner.addWidget(head_w)
+
+        body_te = QTextEdit()
+        body_te.setObjectName('msgBody')
+        body_te.setReadOnly(True)
+        body_te.setFrameShape(QFrame.NoFrame)
+        body_te.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body_te.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        body_te.setLineWrapMode(QTextEdit.WidgetWidth)
+        body_te.setWordWrapMode(QTextOption.WrapAnywhere)
+        body_te.document().setDocumentMargin(0)
+        body_te.setPlainText(content or '')
+        body_te.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        body_te.setStyleSheet(
+            f"QTextEdit {{ color: {t['text']}; font-size: 13px; background: transparent; "
+            f"border: none; padding: 0px; }}"
+        )
+        body_te.document().documentLayout().documentSizeChanged.connect(
+            lambda _=None, b=body_te: self._sync_msg_body_height(b)
+        )
+        inner.addWidget(body_te)
+
+        bubble.setMaximumWidth(self._max_bubble_width())
+
+        row = QWidget()
+        row.setStyleSheet('background: transparent;')
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(4, 4, 4, 4)
+        hl.setSpacing(0)
+        if is_own:
+            hl.addStretch(1)
+            hl.addWidget(bubble, 0, Qt.AlignTop)
+        else:
+            hl.addWidget(bubble, 0, Qt.AlignTop)
+            hl.addStretch(1)
+
+        self.messages_layout.addWidget(row)
+        QTimer.singleShot(0, lambda b=body_te: self._sync_msg_body_height(b))
+        self._scroll_messages_to_bottom()
     
     def closeEvent(self, event):
         """Обработка закрытия окна"""

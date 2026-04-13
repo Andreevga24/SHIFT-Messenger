@@ -13,6 +13,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from client.client import ShiftClient
+from statuses import USER_STATUS_CHOICES
 
 
 class ConsoleClient:
@@ -23,6 +24,8 @@ class ConsoleClient:
         self.username = None
         self.current_chat = None
         self.executor = ThreadPoolExecutor(max_workers=1)
+        self._last_statuses: dict = {}
+        self._unread_counts: dict = {}
     
     async def connect(self):
         """Подключение к серверу"""
@@ -89,6 +92,27 @@ class ConsoleClient:
             await self.client.send_message(self.current_chat, content)
             await asyncio.sleep(0.2)
     
+    async def set_my_status(self):
+        """Выбор статуса из списка"""
+        print("\n--- Статус ---")
+        for i, s in enumerate(USER_STATUS_CHOICES, 1):
+            print(f"  {i:2}. {s}")
+        raw = await self.async_input("Номер статуса (Enter — отмена): ")
+        raw = (raw or "").strip()
+        if not raw:
+            return
+        try:
+            idx = int(raw) - 1
+        except ValueError:
+            print("✗ Введите число")
+            return
+        if not (0 <= idx < len(USER_STATUS_CHOICES)):
+            print("✗ Неверный номер")
+            return
+        await self.client.set_status(USER_STATUS_CHOICES[idx])
+        await asyncio.sleep(0.2)
+        print(f"✓ Статус: {USER_STATUS_CHOICES[idx]}")
+    
     async def async_input(self, prompt: str) -> str:
         """Асинхронный ввод"""
         loop = asyncio.get_running_loop()
@@ -104,6 +128,8 @@ class ConsoleClient:
         self.client.on('history', self.handle_history)
         
         self.client.on('users_list', self.handle_users_list)
+        self.client.on('user_status', self.handle_user_status)
+        self.client.on('unread_counts', self.handle_unread_counts)
         
         self.client.on('error', lambda data: print(f"✗ Ошибка: {data.get('message')}"))
     
@@ -121,9 +147,9 @@ class ConsoleClient:
             formatted_time = timestamp[:19] if len(timestamp) >= 19 else timestamp
         
         if sender == self.current_chat:
-            print(f"\n[{formatted_time}] {sender}: {content}")
+            print(f"\n{sender}  ({formatted_time})\n{content}")
         else:
-            print(f"\n📩 Новое сообщение от {sender}: {content}")
+            print(f"\n📩 Новое сообщение от {sender}  ({formatted_time})\n{content}")
     
     def handle_history(self, data):
         """Обработка истории сообщений"""
@@ -146,24 +172,44 @@ class ConsoleClient:
                 formatted_time = timestamp[:19] if len(timestamp) >= 19 else timestamp
             
             prefix = "Вы" if sender == self.username else sender
-            print(f"[{formatted_time}] {prefix}: {content}")
+            print(f"\n{prefix}  ({formatted_time})\n{content}")
         print("--- Конец истории ---\n")
     
     def handle_users_list(self, data):
         """Обработка списка пользователей"""
         users = data.get('users', [])
         online = set(data.get('online') or [])
+        self._last_statuses = dict(data.get('statuses') or {})
+        self._unread_counts = {
+            str(k): int(v)
+            for k, v in (data.get('unread_counts') or {}).items()
+        }
         if not users:
             print("В базе нет зарегистрированных пользователей")
             return
-        print(f"Зарегистрировано: {len(users)}, онлайн сейчас: {len(online)}")
+        print(f"Зарегистрировано: {len(users)}, в списке «онлайн»: {len(online)}")
         n = 0
         for user in users:
             if user == self.username:
                 continue
             n += 1
-            tag = " [онлайн]" if user in online else ""
-            print(f"  {n}. {user}{tag}")
+            st = self._last_statuses.get(user, 'не в сети')
+            vis = " (в списке онлайн)" if user in online else ""
+            un = self._unread_counts.get(user, 0)
+            un_s = f", непрочитанных: {un}" if un else ""
+            print(f"  {n}. {user} — {st}{vis}{un_s}")
+    
+    def handle_unread_counts(self, data):
+        self._unread_counts = {
+            str(k): int(v)
+            for k, v in (data.get('counts') or {}).items()
+        }
+    
+    def handle_user_status(self, data):
+        u = data.get('user')
+        st = data.get('status')
+        if u is not None and st is not None:
+            self._last_statuses[u] = st
     
     async def run(self):
         """Главный цикл"""
@@ -208,6 +254,7 @@ class ConsoleClient:
                 print("2. Выбрать чат")
                 print("3. Отправить сообщение")
                 print("4. Обновить историю чата")
+                print("5. Установить статус")
                 print("0. Выход")
                 print("=" * 40)
 
@@ -225,6 +272,8 @@ class ConsoleClient:
                         await asyncio.sleep(0.5)
                     else:
                         print("Сначала выберите чат!")
+                elif choice == '5':
+                    await self.set_my_status()
                 elif choice == '0':
                     print("До свидание!")
                     await self.client.disconnect()

@@ -4,10 +4,17 @@ SHIFT Messenger Client
 """
 
 import asyncio
-import websockets
 import json
-from typing import Callable, Optional
+import os
+import sys
+import websockets
 from datetime import datetime
+from typing import Callable, Optional
+
+_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _root not in sys.path:
+    sys.path.insert(0, _root)
+from statuses import DEFAULT_STATUS_ONLINE
 
 
 class ShiftClient:
@@ -17,13 +24,16 @@ class ShiftClient:
         self.websocket: Optional[websockets.ClientConnection] = None
         self.username: Optional[str] = None
         self.connected = False
+        self.current_status: Optional[str] = None
         self.message_handlers = {
             'message': [],
             'message_sent': [],
             'history': [],
             'users_list': [],
             'connected': [],
-            'error': []
+            'error': [],
+            'user_status': [],
+            'unread_counts': [],
         }
         self._response_queue = None
     
@@ -70,6 +80,7 @@ class ShiftClient:
             self.websocket = None
             self.connected = False
             self.username = None
+            self.current_status = None
             self._response_queue = None
             print("Отключено от сервера")
     
@@ -161,6 +172,23 @@ class ShiftClient:
         
         await self.websocket.send(json.dumps(message))
     
+    async def set_status(self, status: str):
+        """Установить статус (сервер проверяет допустимые значения)."""
+        if not self.websocket or not self.connected:
+            print("Нет подключения к серверу")
+            return
+        await self.websocket.send(json.dumps({"type": "set_status", "status": status}))
+    
+    async def mark_read(self, with_user: str):
+        """Пометить переписку с пользователем прочитанной (входящие от with_user)."""
+        if not self.websocket or not self.connected:
+            print("Нет подключения к серверу")
+            return
+        await self.websocket.send(json.dumps({
+            "type": "mark_read",
+            "with_user": with_user,
+        }))
+    
     async def _listen(self):
         """Прослушивание входящих сообщений"""
         try:
@@ -169,6 +197,13 @@ class ShiftClient:
                     data = json.loads(message)
                     message_type = data.get('type')
                     print(f"Получено сообщение типа: {message_type}, данные: {data}")
+                    
+                    if message_type == 'connected':
+                        self.current_status = data.get('status') or DEFAULT_STATUS_ONLINE
+                    elif message_type == 'user_status':
+                        u = data.get('user')
+                        if u and u == self.username:
+                            self.current_status = data.get('status') or DEFAULT_STATUS_ONLINE
                     
                     # Для register и login помещаем ответ в очередь
                     if message_type in ('register', 'connected', 'error') and self._response_queue:
@@ -188,6 +223,7 @@ class ShiftClient:
             print("Соединение с сервером закрыто")
             self.connected = False
             self.username = None
+            self.current_status = None
         except Exception as e:
             print(f"Ошибка прослушивания: {e}")
             self.connected = False
@@ -292,6 +328,26 @@ class SyncShiftClient:
         except Exception as e:
             print(f"Ошибка запроса списка: {e}")
     
+    def set_status(self, status: str):
+        """Установить статус на сервере."""
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.client.set_status(status),
+                self.loop
+            )
+        except Exception as e:
+            print(f"Ошибка установки статуса: {e}")
+    
+    def mark_read(self, with_user: str):
+        """Пометить чат с контактом прочитанным."""
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.client.mark_read(with_user),
+                self.loop
+            )
+        except Exception as e:
+            print(f"Ошибка mark_read: {e}")
+    
     def on(self, event_type: str, callback: Callable):
         """Регистрация обработчика событий"""
         self.client.on(event_type, callback)
@@ -305,6 +361,10 @@ class SyncShiftClient:
     def current_user(self) -> Optional[str]:
         """Текущий пользователь"""
         return self.client.username
+    
+    def get_current_status(self) -> str:
+        """Текст текущего статуса (после входа совпадает с сервером)."""
+        return self.client.current_status or DEFAULT_STATUS_ONLINE
     
     def start_event_loop(self):
         """Запуск цикла событий в отдельном потоке"""

@@ -7,12 +7,24 @@ import asyncio
 import websockets
 import json
 import logging
+import sys
 from datetime import datetime
 from typing import Dict, Set, Optional
 import sqlite3
 import os
 import hashlib
 import aiosqlite
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+from statuses import (
+    ALLOWED_USER_STATUSES,
+    STATUSES_APPEAR_OFFLINE,
+    DEFAULT_STATUS_ONLINE,
+    STATUS_OFFLINE,
+    USER_STATUS_CHOICES,
+)
 
 # Настройка логирования
 logging.basicConfig(
@@ -33,6 +45,7 @@ class ShiftServer:
     def __init__(self):
         self.connected_clients: Dict[str, websockets.ServerConnection] = {}
         self.user_rooms: Dict[str, Set[str]] = {}  # username -> set of room_ids
+        self.user_statuses: Dict[str, str] = {}  # username -> текст статуса
         self.init_database()
     
     def _hash_password(self, password: str) -> str:
@@ -182,6 +195,35 @@ class ShiftServer:
             logger.error(f"Ошибка получения истории: {e}")
             return []
     
+    async def mark_conversation_read(self, reader: str, peer: str) -> None:
+        """Пометить все входящие от peer для reader как прочитанные."""
+        try:
+            async with aiosqlite.connect(DB_PATH) as conn:
+                await conn.execute(
+                    '''UPDATE messages SET is_read = 1
+                       WHERE receiver = ? AND sender = ? AND is_read = 0''',
+                    (reader, peer),
+                )
+                await conn.commit()
+        except Exception as e:
+            logger.error(f"Ошибка mark_conversation_read: {e}")
+    
+    async def get_unread_counts(self, reader: str) -> dict:
+        """Число непрочитанных входящих сообщений по отправителям."""
+        try:
+            async with aiosqlite.connect(DB_PATH) as conn:
+                cursor = await conn.execute(
+                    '''SELECT sender, COUNT(*) FROM messages
+                       WHERE receiver = ? AND is_read = 0
+                       GROUP BY sender''',
+                    (reader,),
+                )
+                rows = await cursor.fetchall()
+            return {row[0]: int(row[1]) for row in rows}
+        except Exception as e:
+            logger.error(f"Ошибка get_unread_counts: {e}")
+            return {}
+    
     async def get_all_users(self) -> list:
         """Получение списка всех зарегистрированных пользователей"""
         try:
@@ -200,6 +242,19 @@ class ShiftServer:
                 await self.connected_clients[username].send(json.dumps(message))
             except Exception as e:
                 logger.error(f"Ошибка отправки сообщения {username}: {e}")
+    
+    def _visible_online_usernames(self) -> list:
+        """Пользователи, которые считаются «в сети» для списка контактов."""
+        return [
+            u for u in self.connected_clients
+            if self.user_statuses.get(u, DEFAULT_STATUS_ONLINE) not in STATUSES_APPEAR_OFFLINE
+        ]
+    
+    async def broadcast_user_status(self, username: str, status: str):
+        """Уведомить всех подключённых о статусе пользователя (в т.ч. «не в сети» при выходе)."""
+        payload = {"type": "user_status", "user": username, "status": status}
+        for u in list(self.connected_clients.keys()):
+            await self.broadcast_to_user(u, payload)
     
     async def handle_client(self, websocket: websockets.ServerConnection):
         """Обработка подключения клиента"""
@@ -259,12 +314,16 @@ class ShiftServer:
                                     logger.debug(f"Закрытие предыдущей сессии: {e}")
                         username = auth_username
                         self.connected_clients[username] = websocket
+                        self.user_statuses[username] = DEFAULT_STATUS_ONLINE
                         logger.info(f"Пользователь {username} подключился")
                         await websocket.send(json.dumps({
                             "type": "connected",
                             "message": "Подключение к серверу SHIFT установлено",
-                            "username": username
+                            "username": username,
+                            "status": self.user_statuses[username],
+                            "allowed_statuses": list(USER_STATUS_CHOICES),
                         }))
+                        await self.broadcast_user_status(username, self.user_statuses[username])
                         continue
                     await websocket.send(json.dumps({
                         "type": "error",
@@ -286,7 +345,10 @@ class ShiftServer:
             # старый обработчик после входа с того же логина с другого сокета).
             if username and self.connected_clients.get(username) is websocket:
                 del self.connected_clients[username]
+                if username in self.user_statuses:
+                    del self.user_statuses[username]
                 logger.info(f"Пользователь {username} отключился")
+                await self.broadcast_user_status(username, STATUS_OFFLINE)
 
 
 async def process_message(server: ShiftServer, sender: str, data: dict):
@@ -320,6 +382,11 @@ async def process_message(server: ShiftServer, sender: str, data: dict):
             "content": content,
             "timestamp": datetime.now().isoformat()
         })
+        unread_recv = await server.get_unread_counts(receiver)
+        await server.broadcast_to_user(receiver, {
+            "type": "unread_counts",
+            "counts": unread_recv,
+        })
         
         # Подтверждение отправителю
         await server.broadcast_to_user(sender, {
@@ -342,17 +409,52 @@ async def process_message(server: ShiftServer, sender: str, data: dict):
                 "user": other_user,
                 "messages": history
             })
+            await server.mark_conversation_read(sender, other_user)
+            unread = await server.get_unread_counts(sender)
+            await server.broadcast_to_user(sender, {
+                "type": "unread_counts",
+                "counts": unread,
+            })
     
     elif message_type == 'get_users':
         # Запрос списка всех пользователей
         all_users = await server.get_all_users()
-        online_users = list(server.connected_clients.keys())
+        visible_online = server._visible_online_usernames()
+        statuses_map = {u: STATUS_OFFLINE for u in all_users}
+        for u in server.connected_clients:
+            statuses_map[u] = server.user_statuses.get(u, DEFAULT_STATUS_ONLINE)
         
+        unread_map = await server.get_unread_counts(sender)
         await server.broadcast_to_user(sender, {
             "type": "users_list",
             "users": all_users,
-            "online": online_users
+            "online": visible_online,
+            "statuses": statuses_map,
+            "unread_counts": unread_map,
         })
+    
+    elif message_type == 'mark_read':
+        peer = data.get('with_user')
+        if not isinstance(peer, str) or not peer.strip():
+            return
+        peer = peer.strip()
+        await server.mark_conversation_read(sender, peer)
+        unread_map = await server.get_unread_counts(sender)
+        await server.broadcast_to_user(sender, {
+            "type": "unread_counts",
+            "counts": unread_map,
+        })
+    
+    elif message_type == 'set_status':
+        status = data.get('status')
+        if not isinstance(status, str) or status not in ALLOWED_USER_STATUSES:
+            await server.broadcast_to_user(sender, {
+                "type": "error",
+                "message": "Недопустимый статус",
+            })
+            return
+        server.user_statuses[sender] = status
+        await server.broadcast_user_status(sender, status)
 
 
 async def main():
